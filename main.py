@@ -24,30 +24,15 @@ builder.add_node("Logistics", logistics_agent)
 builder.add_node("Validation", validation_node)
 
 # --- Orchestrator Routing Logic ---
-# The Orchestrator will be the entry point and decide where to go.
 
 async def orchestrator_node(state: AgentState):
-    # This node just acts as a pass-through for the decision logic
-    # if we wanted to record the orchestration step in the message history.
-    # For now, we'll use the orchestrator_router directly as conditional edges.
+    # Node to trigger the orchestrator router
     return state
 
 builder.add_node("Orchestrator", orchestrator_node)
 builder.set_entry_point("Orchestrator")
 
-def route_from_orchestrator(state: AgentState):
-    # This is a synchronous wrapper for the router logic if needed,
-    # but LangGraph supports async routers.
-    # However, for simplicity in edges, let's use the logic from agents.py
-    # We'll use a wrapper since add_conditional_edges expects a function returning a string or list.
-    pass
-
-# We will use the orchestrator_router to decide which agents to run.
-# To handle multiple agents in parallel from the router, we'd need a more complex setup.
-# For this demo, we'll follow a slightly simplified but dynamic routing:
-# Orchestrator -> [Sales | Warehouse | Logistics | End]
-# If Sales is chosen, it then goes to Warehouse/Logistics if needed, then Validation.
-
+# Conditional edges from Orchestrator to any combination of agents
 builder.add_conditional_edges(
     "Orchestrator",
     orchestrator_router,
@@ -55,17 +40,20 @@ builder.add_conditional_edges(
         "Sales": "Sales",
         "Warehouse": "Warehouse",
         "Logistics": "Logistics",
-        "End": END
+        "__end__": END
     }
 )
 
-# Standard flow if Sales is picked first (it usually is for new orders)
-builder.add_edge("Sales", "Warehouse")
-builder.add_edge("Sales", "Logistics")
+# After each agent, we want to go to Validation
+# However, if we run them in parallel, we need to wait for all to finish.
+# In LangGraph, if multiple nodes are triggered from a conditional edge,
+# they run in parallel and you can converge them to a single node.
+
+builder.add_edge("Sales", "Validation")
 builder.add_edge("Warehouse", "Validation")
 builder.add_edge("Logistics", "Validation")
 
-# If Warehouse or Logistics were called directly by Orchestrator
+# Final step
 builder.add_edge("Validation", END)
 
 # Compile with memory persistence
