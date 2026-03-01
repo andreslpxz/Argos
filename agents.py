@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import asyncio
 from typing import Dict, Any, List, TypedDict, Annotated, Sequence, Optional
 from langchain_groq import ChatGroq
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
@@ -79,14 +80,20 @@ Analyze the current situation:
 {solution}
 
 CRITICAL DECISION RULES:
-1. If weather risk factor > 0.7, you MUST propose an alternative (e.g., 'wait 2 days', 'reroute through different hub') instead of a simple rejection.
-2. If stock for any item is < 10% of requested quantity, you MUST propose an alternative (e.g., 'partial shipment', 'ship from alternative warehouse B', 'wait for restock').
+1. If weather risk factor > 0.7, you MUST return STATUS: PROPOSAL or REJECTED.
+2. If stock for any item is < 10% of requested quantity, you MUST return STATUS: PROPOSAL or REJECTED.
 3. If neither rule is triggered, the status is 'VALID'.
 
-Output your decision in this format:
-STATUS: [VALID | PROPOSAL]
+CRITICAL INSTRUCTIONS FOR PROPOSAL/REJECTED:
+If the status is PROPOSAL or REJECTED, you must:
+- Explain clearly and in detail the reason (e.g., storm at delivery location, critical lack of stock).
+- Offer a CREATIVE logistical solution (e.g., reroute, use a different shipping method, switch warehouses, or suggest a partial delivery).
+- The "REASON" and "ALTERNATIVE" fields should be detailed and persuasive.
+
+Output your decision in this exact format:
+STATUS: [VALID | PROPOSAL | REJECTED]
 REASON: [Reason for proposal or validation]
-ALTERNATIVE: [Description of the alternative if STATUS is PROPOSAL]
+ALTERNATIVE: [Description of the alternative if STATUS is not VALID]
 """
 
 # --- AGENT FUNCTIONS ---
@@ -94,45 +101,61 @@ ALTERNATIVE: [Description of the alternative if STATUS is PROPOSAL]
 async def sales_agent(state: AgentState):
     last_message = state['messages'][-1].content
 
-    # 1. Query catalog to identify SKUs
-    catalog = await db_manager.query_catalog(last_message)
+    # 1. First Task: Extract SKUs and quantities using strict JSON output
+    # We provide the catalog context directly to the LLM for accurate SKU mapping
+    catalog_context = db_manager.catalog
 
-    # Use LLM to extract structured information
-    extraction_prompt = f"Extract SKUs, quantities and location from this message: '{last_message}'. Use this catalog for SKUs: {catalog}. Return a JSON list of objects with 'sku', 'quantity', and 'location'."
-    extraction_response = await support_llm.ainvoke([SystemMessage(content="You are a data extraction assistant. Return ONLY valid JSON."), HumanMessage(content=extraction_prompt)])
+    extraction_prompt = f"""Extract SKUs, quantities and location from this message: '{last_message}'.
+    Use this catalog for SKU mapping: {json.dumps(catalog_context)}.
+
+    CRITICAL: Return ONLY a valid JSON list of objects.
+    Format: [{{"sku": "SKU_CODE", "quantity": 0, "location": "city or null"}}]"""
+
+    extraction_response = await support_llm.ainvoke([
+        SystemMessage(content="You are a data extraction assistant. Return ONLY valid JSON in a strict list format."),
+        HumanMessage(content=extraction_prompt)
+    ])
 
     try:
-        # Simple extraction logic
         json_match = re.search(r'\[.*\]', extraction_response.content, re.DOTALL)
-        if json_match:
-            requested = json.loads(json_match.group())
-        else:
-            requested = []
-    except:
+        requested = json.loads(json_match.group()) if json_match else []
+    except Exception:
         requested = []
 
-    # 2. Get demand history for each SKU to justify quantities
+    # 2. Support tasks: Get demand history and catalog results for the final summary
     demand_history = {}
     for item in requested:
-        sku = item['sku']
-        demand_history[sku] = await db_manager.get_demand_history(sku)
+        sku = item.get('sku')
+        if sku:
+            demand_history[sku] = await db_manager.get_demand_history(sku)
 
-    prompt = SALES_PROMPT.format(context=last_message, catalog=catalog, demand=demand_history)
+    # We also keep catalog_results in state for other agents if needed
+    catalog_results = await db_manager.query_catalog(last_message)
+
+    prompt = SALES_PROMPT.format(context=last_message, catalog=catalog_results, demand=demand_history)
     response = await support_llm.ainvoke([SystemMessage(content=prompt)])
 
     return {
         "messages": [response],
-        "catalog_results": catalog,
+        "catalog_results": catalog_results,
         "requested_items": requested,
         "demand_history": [demand_history]
     }
 
 async def warehouse_agent(state: AgentState):
-    inventory = {}
     items = state.get('requested_items', [])
+
+    # Concurrent inventory checks using asyncio.gather
+    inventory_tasks = []
+    skus = []
     for item in items:
-        sku = item['sku']
-        inventory[sku] = await get_inventory_levels(sku)
+        sku = item.get('sku')
+        if sku:
+            skus.append(sku)
+            inventory_tasks.append(get_inventory_levels(sku))
+
+    inventory_results = await asyncio.gather(*inventory_tasks)
+    inventory = {sku: res for sku, res in zip(skus, inventory_results)}
 
     prompt = WAREHOUSE_PROMPT.format(context=str(items), inventory=inventory)
     response = await support_llm.ainvoke([SystemMessage(content=prompt)])
@@ -173,20 +196,26 @@ async def validation_node(state: AgentState):
         reasons.append(f"Weather risk too high ({weather_risk})")
 
     for req in requested_items:
-        sku = req['sku']
-        qty_requested = req['quantity']
+        sku = req.get('sku')
+        qty_requested = req.get('quantity', 0)
         inv_item = inventory.get(sku, {})
         qty_available = inv_item.get('quantity', 0)
 
         if qty_available < (0.1 * qty_requested):
             reasons.append(f"Critical stock for {sku}: requested {qty_requested}, only {qty_available} available")
 
-    solution_summary = f"Inventory: {inventory}\nWeather: {weather_risk}\nRequested: {requested_items}"
+    solution_summary = f"Inventory: {inventory}\nWeather Risk: {weather_risk}\nRequested: {requested_items}"
     prompt = REFLECTION_PROMPT.format(solution=solution_summary)
     response = await brain_llm.ainvoke([SystemMessage(content=prompt)])
 
-    # Update status based on reasons for internal tracking, though LLM decides the alternative
-    status = "VALID" if not reasons else "PROPOSAL"
+    # Extract status from LLM response
+    llm_content = response.content.upper()
+    if "STATUS: VALID" in llm_content:
+        status = "VALID"
+    elif "STATUS: REJECTED" in llm_content:
+        status = "REJECTED"
+    else:
+        status = "PROPOSAL"
 
     return {
         "messages": [response],
@@ -195,6 +224,12 @@ async def validation_node(state: AgentState):
 
 async def orchestrator_router(state: AgentState):
     last_message = state['messages'][-1].content
+
+    # Preliminary closure check
+    terminal_phrases = ["gracias", "de acuerdo", "perfecto", "entendido", "chau", "adios", "ok"]
+    if any(phrase in last_message.lower() for phrase in terminal_phrases):
+        return ["__end__"]
+
     prompt = ORCHESTRATOR_PROMPT.format(context=last_message)
     response = await brain_llm.ainvoke([SystemMessage(content=prompt)])
 
